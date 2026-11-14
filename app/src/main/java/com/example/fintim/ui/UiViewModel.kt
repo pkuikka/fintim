@@ -1,0 +1,930 @@
+package com.example.fintim.ui
+
+import android.Manifest
+import android.app.Application
+import android.content.Context
+import android.net.Uri
+import android.os.Looper
+import android.util.Log
+import android.widget.Toast
+import androidx.annotation.RequiresPermission
+import androidx.datastore.preferences.core.edit
+import androidx.datastore.preferences.core.stringPreferencesKey
+import androidx.datastore.preferences.preferencesDataStore
+import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.ViewModelProvider
+import androidx.lifecycle.ViewModelProvider.AndroidViewModelFactory.Companion.APPLICATION_KEY
+import androidx.lifecycle.viewModelScope
+import androidx.lifecycle.viewmodel.initializer
+import androidx.lifecycle.viewmodel.viewModelFactory
+import com.example.fintim.BtCommunication
+import com.example.fintim.PtTimerApplication
+import com.example.fintim.data.MAX_TIMER_DATA_ROWS
+import com.example.fintim.data.TimerData
+import com.example.fintim.data.TimerDataSetsWrapper
+import com.example.fintim.data.UserPreferencesRepository
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
+import kotlinx.serialization.json.Json
+import java.io.File
+import java.io.FileNotFoundException
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+
+
+class UiViewModel(
+    application: Application,
+    private val userPreferencesRepository: UserPreferencesRepository,
+    private val applicationContext: Context
+) : AndroidViewModel(application) {
+    private val _uiState = MutableStateFlow(UiState())
+    val uiState: StateFlow<UiState> = _uiState.asStateFlow()
+    private val btCommunication = BtCommunication(application.applicationContext)
+
+    private val _showMismatchDialog = MutableStateFlow(false)
+    val showMismatchDialog: StateFlow<Boolean> = _showMismatchDialog.asStateFlow()
+    private val _mismatchDialogMessage = MutableStateFlow("")
+    val mismatchDialogMessage: StateFlow<String> = _mismatchDialogMessage.asStateFlow()
+
+    private var onConfirmWriteAction: (() -> Unit)? = null
+    private var onCancelWriteAction: (() -> Unit)? = null
+
+    private val Context.dataStore by preferencesDataStore(name = "settings")
+    private fun getCommentKey(modelName: String) =
+        stringPreferencesKey("comment_$modelName")
+    private fun getBatteryTypeKey(modelName: String) =
+        stringPreferencesKey("battery_type_$modelName")
+    private fun getSetsKey(modelName: String) =
+        stringPreferencesKey("sets_data_$modelName")
+
+
+    fun onConfirmMismatchDialog() {
+        onConfirmWriteAction?.invoke()
+        _showMismatchDialog.value = false
+    }
+
+    fun onDismissMismatchDialog() {
+        onConfirmWriteAction = null
+        onCancelWriteAction?.invoke()
+        onCancelWriteAction = null
+        _showMismatchDialog.value = false
+    }
+
+    fun getSavedFilesList() {
+        val internalDir = applicationContext.filesDir
+        val files = internalDir.listFiles { _, name -> name.endsWith(".json") }
+            ?.map { it.name }
+            ?.sorted()
+            ?: emptyList()
+        _uiState.update { it.copy(savedFiles = files) }
+    }
+
+    init {
+        viewModelScope.launch {
+            userPreferencesRepository.displaySwipeVelocity.collect { displaySwipeVelocity ->
+                // 3. Update the UI state with the value from the repository
+                _uiState.update { currentState ->
+                    currentState.copy(displaySwipeVelocity = displaySwipeVelocity)
+                }
+            }
+        }
+        viewModelScope.launch {
+            userPreferencesRepository.displaySwipeDistance.collect { displaySwipeDistance ->
+                // 3. Update the UI state with the value from the repository
+                _uiState.update { currentState ->
+                    currentState.copy(displaySwipeDistance = displaySwipeDistance)
+                }
+            }
+        }
+        viewModelScope.launch {
+            userPreferencesRepository.selectedBtDevice.collect { deviceName ->
+                _uiState.update { currentState ->
+                    currentState.copy(selectedBtDevice = deviceName)
+                }
+            }
+        }
+    }
+
+    // Generic function to update the TimerData object in the state
+    // Can be used to edit e.g. single value
+    fun updateTimerData(updateAction: TimerData.() -> TimerData) {
+        _uiState.update { currentState ->
+            val updatedTimerData = currentState.timerData.updateAction()
+            currentState.copy(timerData = updatedTimerData)
+        }
+    }
+
+    fun onRowSelected(row: Int) {
+        _uiState.update { it.copy(selectedRow = row) }
+    }
+
+    // Function to update the list of BT devices in the state
+
+    //@RequiresPermission(Manifest.permission.BLUETOOTH_CONNECT)
+    @RequiresPermission(Manifest.permission.BLUETOOTH_CONNECT)
+    fun refreshPairedDevices() {
+        if (btCommunication.checkBlePermissions()) {
+            val pairedDevices =
+                btCommunication.getPairedDevices() // Assume this function exists in BtCommunication
+            _uiState.update { currentState ->
+                currentState.copy(btDevices = pairedDevices)
+            }
+        }
+    }
+
+    @RequiresPermission(Manifest.permission.BLUETOOTH_CONNECT)
+    fun read() {
+        val batteryType = uiState.value.timerData.batteryType
+        val s2Divisor = uiState.value.tempS2BatteryVoltageDivisor
+        // Read the timer data via bluetooth
+        btCommunication.connectDevice(selectedDevice = uiState.value.selectedBtDevice) { isSuccess ->
+            if (isSuccess) {
+                btCommunication.timerCommunication(
+                    batteryType = batteryType,
+                    s2Divisor = s2Divisor,
+                    onDataReceived = { bytes, voltage -> processIncomingPacket(bytes, voltage) }
+                )
+            }
+        }
+    }
+
+    @RequiresPermission(Manifest.permission.BLUETOOTH_CONNECT)
+    fun write() {
+        // Update write timestamp before writing it to timer
+        val newTimeStamp = SimpleDateFormat("yyMMddHHmm", Locale.US).format(Date())
+        updateTimerData { copy(writeTimeStamp = newTimeStamp) }
+
+        // Take timer data only after updating the write time
+        val currentTimerData = _uiState.value.timerData
+        val packetToSend = currentTimerData.toPacket()
+        val batteryType = currentTimerData.batteryType
+        val s2Divisor = _uiState.value.tempS2BatteryVoltageDivisor
+
+        btCommunication.connectDevice(selectedDevice = uiState.value.selectedBtDevice) { isSuccess ->
+            if (isSuccess) {
+                btCommunication.timerCommunication(
+                    packetToSend = packetToSend,
+                    batteryType = batteryType,
+                    s2Divisor = s2Divisor,
+                    onDataReceived = { bytes, voltage -> processIncomingPacket(bytes, voltage) },
+                    onConfirmationRequired = { message, onConfirm, onCancel ->
+                        onConfirmWriteAction = onConfirm
+                        onCancelWriteAction = onCancel
+                        _mismatchDialogMessage.value = message
+                        _showMismatchDialog.value = true
+                    }
+                )
+            }
+        }
+    }
+
+    fun loadCommentForModel(modelName: String) {
+        viewModelScope.launch {
+            applicationContext.dataStore.data
+                .map { preferences ->
+                    // Return the comment or empty string if none exists
+                    preferences[getCommentKey(modelName)] ?: ""
+                }
+                .collect { storedComment ->
+                    // Update the UI state without triggering a full file load
+                    _uiState.update { currentState ->
+                        currentState.copy(
+                            timerData = currentState.timerData.copy(comments = storedComment)
+                        )
+                    }
+                }
+        }
+    }
+
+    fun saveCommentForModel(modelName: String, comment: String) {
+        viewModelScope.launch {
+            applicationContext.dataStore.edit { preferences ->
+                preferences[getCommentKey(modelName)] = comment
+            }
+        }
+    }
+
+    fun deleteCommentForModel(modelName: String) {
+        viewModelScope.launch {
+            applicationContext.dataStore.edit { preferences ->
+                preferences.remove(getCommentKey(modelName))
+            }
+        }
+    }
+
+    fun loadBatteryTypeForModel(modelName: String) {
+        viewModelScope.launch {
+            applicationContext.dataStore.data
+                .map { preferences ->
+                    preferences[getBatteryTypeKey(modelName)] ?: "S3"
+                }
+                .collect { storedBatteryType ->
+                    _uiState.update { currentState ->
+                        currentState.copy(
+                            timerData = currentState.timerData.copy(batteryType = storedBatteryType)
+                        )
+                    }
+                }
+        }
+    }
+
+    fun saveBatteryTypeForModel(modelName: String, batteryType: String) {
+        viewModelScope.launch {
+            applicationContext.dataStore.edit { preferences ->
+                preferences[getBatteryTypeKey(modelName)] = batteryType
+            }
+        }
+    }
+
+    fun deleteBatteryTypeForModel(modelName: String) {
+        viewModelScope.launch {
+            applicationContext.dataStore.edit { preferences ->
+                preferences.remove(getBatteryTypeKey(modelName))
+            }
+        }
+    }
+
+    fun loadSetsForModel(modelName: String) {
+        viewModelScope.launch {
+            applicationContext.dataStore.data
+                .map { preferences ->
+                    val jsonString = preferences[getSetsKey(modelName)]
+                    if (!jsonString.isNullOrEmpty()) {
+                        try {
+                            Json.decodeFromString<TimerDataSetsWrapper>(jsonString)
+                        } catch (_: Exception) {
+                            null // Fallback to null if parsing fails
+                        }
+                    } else {
+                        null
+                    }
+                }
+                .collect { loadedSets ->
+                    if (loadedSets != null) {
+                        _uiState.update { currentState ->
+                            currentState.copy(
+                                timerData = currentState.timerData.copy(
+                                    setNames = loadedSets.setNames,
+                                    setTimeValues = loadedSets.setTimeValues,
+                                    setServo1Values = loadedSets.setServo1Values,
+                                    setServo2Values = loadedSets.setServo2Values,
+                                    setServo3Values = loadedSets.setServo3Values,
+                                    setServo4Values = loadedSets.setServo4Values
+                                )
+                            )
+                        }
+                    }
+                }
+        }
+    }
+
+    // Call this whenever you update any of the 'set...' properties in TimerData
+    fun saveSetsForModel(modelName: String, timerData: TimerData) {
+        viewModelScope.launch {
+            val wrapper = TimerDataSetsWrapper(
+                setNames = timerData.setNames,
+                setTimeValues = timerData.setTimeValues,
+                setServo1Values = timerData.setServo1Values,
+                setServo2Values = timerData.setServo2Values,
+                setServo3Values = timerData.setServo3Values,
+                setServo4Values = timerData.setServo4Values
+            )
+
+            val jsonString = Json.encodeToString(wrapper)
+
+            applicationContext.dataStore.edit { preferences ->
+                preferences[getSetsKey(modelName)] = jsonString
+            }
+        }
+    }
+
+    fun deleteSetsForModel(modelName: String) {
+        viewModelScope.launch {
+            applicationContext.dataStore.edit { preferences ->
+                preferences.remove(getSetsKey(modelName))
+            }
+        }
+    }
+
+    fun onSwipeVelocityChanged(delay: Float) {
+        viewModelScope.launch {
+            userPreferencesRepository.saveSwipeVelocity(delay)
+        }
+    }
+
+    fun onSwipeDistanceChange(delay: Float) {
+        viewModelScope.launch {
+            userPreferencesRepository.saveSwipeDistance(delay)
+        }
+    }
+
+    fun onDeviceSelected(deviceName: String) {
+        viewModelScope.launch {
+            userPreferencesRepository.saveSelectedDevice(deviceName)
+        }
+    }
+
+    fun onS2DivisorChanged(divisor: Double) {
+        _uiState.update { it.copy(tempS2BatteryVoltageDivisor = divisor) }
+    }
+
+    fun updateCheckBoxes(servo: Int, isSet: Boolean) {
+        Log.i("UiViewModel", "updateCheckBoxes: servo=$servo, isSet=$isSet")
+        _uiState.update { currentState ->
+            val newServoReversed = currentState.timerData.servoReversed.toMutableList().apply {
+                this[servo] = if (isSet) 1 else 0
+            }
+            val updatedTimerData = currentState.timerData.copy(servoReversed = newServoReversed)
+            currentState.copy(timerData = updatedTimerData)
+        }
+    }
+
+    fun onGridItemChanged(index: Int, newValue: String) {
+        val newIntValue = newValue.toIntOrNull() ?: 0
+        val row = index / 6
+        val col = index % 6
+
+        Log.i("UiViewModel", "onGridItemChanged: row=$row, col=$col, newValue=$newValue")
+
+        // Update selected row for the UI (column 0 is usually the selector)
+        _uiState.update { it.copy(selectedRow = if (col == 0) row else -1) }
+
+        when {
+            // Column 0: Step selection popup logic
+            row > 2 && col == 0 -> updateTimerData {
+                val listIndex = row - 3
+                val stepValue = when (newValue) {
+                    "S" -> 0
+                    "R" -> 1
+                    "D" -> 2
+                    "A" -> 3
+                    else -> stepValues[listIndex]
+                }
+                val newStepValues = stepValues.toMutableList().apply {
+                    this[listIndex] = stepValue
+                    if (stepValue == 2) {
+                        this[MAX_TIMER_DATA_ROWS-1] = stepValue
+                    }
+                }
+                copy(stepValues = newStepValues)
+            }
+
+            // Row 1: Standby values (Cols 2-5 map to List indices 0-3)
+            row == 1 && col > 1 -> updateTimerData {
+                copy(servoStandByValues = servoStandByValues.toMutableList().apply { this[col - 2] = newIntValue })
+            }
+
+            // Row 2: Start values
+            row == 2 && col > 1 -> updateTimerData {
+                copy(servoStartValues = servoStartValues.toMutableList().apply { this[col - 2] = newIntValue })
+            }
+
+            // Row 3+: Data rows
+            row > 2 && col > 0 -> updateTimerData {
+                val listIndex = row - 3
+                val updatedData = when (col) {
+                    1 -> copy(timeValues = timeValues.toMutableList().apply { this[listIndex] = newValue.toDoubleOrNull() ?: 0.0 })
+                    2 -> copy(servo1Values = servo1Values.toMutableList().apply { this[listIndex] = newIntValue })
+                    3 -> copy(servo2Values = servo2Values.toMutableList().apply { this[listIndex] = newIntValue })
+                    4 -> copy(servo3Values = servo3Values.toMutableList().apply { this[listIndex] = newIntValue })
+                    5 -> copy(servo4Values = servo4Values.toMutableList().apply { this[listIndex] = newIntValue })
+                    else -> this
+                }
+
+                if (row != 18 && updatedData.stepValues[listIndex] == 2) {
+                    Log.i("UiViewModel", "onGridItemChanged: updating row 16 to newValue=$newValue")
+                    when (col) {
+                        1 -> updatedData.copy(timeValues = updatedData.timeValues.toMutableList().apply { this[MAX_TIMER_DATA_ROWS-1] = newValue.toDoubleOrNull() ?: 0.0 })
+                        2 -> updatedData.copy(servo1Values = updatedData.servo1Values.toMutableList().apply { this[MAX_TIMER_DATA_ROWS-1] = newIntValue })
+                        3 -> updatedData.copy(servo2Values = updatedData.servo2Values.toMutableList().apply { this[MAX_TIMER_DATA_ROWS-1] = newIntValue })
+                        4 -> updatedData.copy(servo3Values = updatedData.servo3Values.toMutableList().apply { this[MAX_TIMER_DATA_ROWS-1] = newIntValue })
+                        5 -> updatedData.copy(servo4Values = updatedData.servo4Values.toMutableList().apply { this[MAX_TIMER_DATA_ROWS-1] = newIntValue })
+                        else -> updatedData
+                    }
+                } else {
+                    updatedData
+                }
+            }
+        }
+    }
+
+    private fun processIncomingPacket(
+        packetBytes: ByteArray,
+        batteryVoltage: Float,
+    ) {
+        try {
+            // Talleta nimi talteen, koska sitä ei ole timerin datassa
+            val name = _uiState.value.timerData.modelName
+            val currentModelId = _uiState.value.timerData.modelId
+
+            // Use the factory function to create the TimerData object
+            val parsedData = TimerData.fromPacket(packetBytes)
+            val newTimerData = parsedData.copy(
+                batteryVoltage = batteryVoltage,
+                // Restore name only if it's the same physical model (ID matches)
+                modelName = if (currentModelId == parsedData.modelId) name else parsedData.modelName
+            )
+
+            Log.i("UiViewModel", "Updated data: $newTimerData")
+
+            // Update the UI state with the newly parsed data
+            _uiState.update { currentState ->
+                currentState.copy(timerData = newTimerData)
+            }
+        } catch (e: IllegalArgumentException) {
+            // Handle the case where the packet is the wrong size
+            Log.e("UiViewModel", "Received invalid packet: ${e.message}")
+        } catch (e: Exception) {
+            // Handle any other potential parsing errors
+            Log.e("UiViewModel", "Failed to parse timer data packet.", e)
+        }
+    }
+
+    fun loadJsonFromFile(filename: String) {
+        viewModelScope.launch {
+            try {
+                val file = File(applicationContext.filesDir, filename)
+                val jsonString = file.bufferedReader().use { it.readText() }
+                val loadedTimerData = Json.decodeFromString<TimerData>(jsonString)
+
+                // Reset battery voltage to 0.0 when loading from file
+                _uiState.update { it.copy(timerData = loadedTimerData.copy(batteryVoltage = 0f)) }
+
+                loadCommentForModel(loadedTimerData.modelName)
+                loadBatteryTypeForModel(loadedTimerData.modelName)
+                loadSetsForModel(loadedTimerData.modelName)
+
+                Log.i("UiViewModel", "File loaded: $filename")
+                android.os.Handler(Looper.getMainLooper()).post {
+                    Toast.makeText(applicationContext, "Loaded: $filename", Toast.LENGTH_SHORT)
+                        .show()
+                }
+            } catch (e: FileNotFoundException) {
+                Log.e("UiViewModel", "File not found: $filename", e)
+                android.os.Handler(Looper.getMainLooper()).post {
+                    Toast.makeText(applicationContext, "Error: File not found.", Toast.LENGTH_SHORT)
+                        .show()
+                }
+            } catch (e: Exception) {
+                Log.e("UiViewModel", "Failed to load file: $filename", e)
+            }
+        }
+    }
+
+    fun saveJsonToFile() {
+        // We now generate the filename internally from the modelName
+        val currentTimerData = _uiState.value.timerData
+        val filename = currentTimerData.modelName.replace(Regex("[^a-zA-Z0-9.-]"), "_") + ".json"
+
+        try {
+            val json = Json { prettyPrint = true; encodeDefaults = true }
+            val jsonString = json.encodeToString(currentTimerData)
+            Log.i("UiViewModel", "File content to be saved to $filename: $jsonString")
+
+            applicationContext.openFileOutput(filename, Context.MODE_PRIVATE).use { outputStream ->
+                outputStream.write(jsonString.toByteArray())
+            }
+
+            saveCommentForModel(currentTimerData.modelName, currentTimerData.comments)
+            saveBatteryTypeForModel(currentTimerData.modelName, currentTimerData.batteryType)
+            saveSetsForModel(currentTimerData.modelName, currentTimerData)
+
+            Log.i("UiViewModel", "Successfully saved file to $filename")
+            android.os.Handler(Looper.getMainLooper()).post {
+                Toast.makeText(applicationContext, "File saved successfully!", Toast.LENGTH_LONG)
+                    .show()
+            }
+            getSavedFilesList()
+
+        } catch (e: Exception) {
+            Log.e("UiViewModel", "Failed to save file", e)
+            android.os.Handler(Looper.getMainLooper()).post {
+                Toast.makeText(applicationContext, "Error: Failed to save file.", Toast.LENGTH_LONG)
+                    .show()
+            }
+        }
+    }
+
+    fun deleteFile(filename: String) {
+        viewModelScope.launch {
+            try {
+                val file = File(applicationContext.filesDir, filename)
+                if (file.exists()) {
+                    val deleted = file.delete()
+                    if (deleted) {
+                        deleteCommentForModel(filename)
+                        deleteBatteryTypeForModel(filename)
+                        deleteSetsForModel(filename)
+                        Log.i("UiViewModel", "File deleted: $filename")
+                        android.os.Handler(Looper.getMainLooper()).post {
+                            Toast.makeText(applicationContext, "File deleted.", Toast.LENGTH_SHORT)
+                                .show()
+                        }
+                        getSavedFilesList()
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e("UiViewModel", "File deletion failed.", e)
+            }
+        }
+    }
+
+    fun exportAllFilesToDirectory(treeUri: Uri) {
+        viewModelScope.launch {
+            // Get the directory the user picked
+            val parentDirectory = androidx.documentfile.provider.DocumentFile.fromTreeUri(applicationContext, treeUri)
+            if (parentDirectory == null || !parentDirectory.canWrite()) {
+                Log.e("UiViewModel", "Cannot write to the selected directory.")
+                android.os.Handler(Looper.getMainLooper()).post {
+                    Toast.makeText(applicationContext, "Error: Cannot write to selected folder.", Toast.LENGTH_SHORT).show()
+                }
+                return@launch
+            }
+
+            // Get the list of all internal files
+            val internalFiles = applicationContext.filesDir.listFiles { _, name -> name.endsWith(".json") }
+            if (internalFiles.isNullOrEmpty()) {
+                Log.i("UiViewModel", "No files to export.")
+                android.os.Handler(Looper.getMainLooper()).post {
+                    Toast.makeText(applicationContext, "No saved files to export.", Toast.LENGTH_SHORT).show()
+                }
+                return@launch
+            }
+
+            var successCount = 0
+            var failureCount = 0
+
+            // Loop through each internal file and export it
+            for (file in internalFiles) {
+                try {
+                    // Create a new file in the selected external directory
+                    val newFile = parentDirectory.createFile("application/json", file.name)
+                    if (newFile == null) {
+                        failureCount++
+                        continue // Skip to the next file
+                    }
+
+                    // Read the content of the internal file
+                    val content = file.readBytes()
+
+                    // Write the content to the new external file
+                    applicationContext.contentResolver.openOutputStream(newFile.uri)?.use { outputStream ->
+                        outputStream.write(content)
+                    }
+                    successCount++
+                } catch (e: Exception) {
+                    failureCount++
+                    Log.e("UiViewModel", "Failed to export file: ${file.name}", e)
+                }
+            }
+
+            // Report the result to the user
+            val message = if (failureCount > 0) {
+                "Export complete. Success: $successCount, Failed: $failureCount"
+            } else {
+                "Exported $successCount files successfully."
+            }
+            android.os.Handler(Looper.getMainLooper()).post {
+                Toast.makeText(applicationContext, message, Toast.LENGTH_LONG).show()
+            }
+        }
+    }
+
+    fun importTimerDataFromUri(uri: Uri) {
+        viewModelScope.launch {
+            try {
+                // Use a content resolver to open an input stream from the URI
+                applicationContext.contentResolver.openInputStream(uri)?.use { inputStream ->
+                    val jsonString = inputStream.bufferedReader().use { it.readText() }
+                    val loadedTimerData = Json.decodeFromString<TimerData>(jsonString)
+
+                    _uiState.update { it.copy(timerData = loadedTimerData) }
+                    loadCommentForModel(loadedTimerData.modelName)
+                    loadBatteryTypeForModel(loadedTimerData.modelName)
+                    loadSetsForModel(loadedTimerData.modelName)
+
+                    Log.i("UiViewModel", "File imported successfully from URI: $uri")
+                    // Show a confirmation toast
+                    android.os.Handler(Looper.getMainLooper()).post {
+                        Toast.makeText(applicationContext, "Imported successfully!", Toast.LENGTH_SHORT).show()
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e("UiViewModel", "Failed to import file from URI: $uri", e)
+                android.os.Handler(Looper.getMainLooper()).post {
+                    Toast.makeText(applicationContext, "Error: Failed to import file.", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
+    }
+
+    fun exportTimerDataToUri(uri: Uri) {
+        viewModelScope.launch {
+            try {
+                // Get the current data to save
+                val currentTimerData = _uiState.value.timerData
+                val json = Json { prettyPrint = true; encodeDefaults = true }
+                val jsonString = json.encodeToString(currentTimerData)
+
+                // Use a content resolver to open an output stream to the URI
+                applicationContext.contentResolver.openOutputStream(uri)?.use { outputStream ->
+                    outputStream.write(jsonString.toByteArray())
+                }
+
+                Log.i("UiViewModel", "File exported successfully to URI: $uri")
+                android.os.Handler(Looper.getMainLooper()).post {
+                    Toast.makeText(applicationContext, "Exported successfully!", Toast.LENGTH_SHORT).show()
+                }
+            } catch (e: Exception) {
+                Log.e("UiViewModel", "Failed to export file to URI: $uri", e)
+                android.os.Handler(Looper.getMainLooper()).post {
+                    Toast.makeText(applicationContext, "Error: Failed to export file.", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
+    }
+
+    fun addRow() {
+        val rowToAdd = _uiState.value.selectedRow - 2 // vähennä start ja standby rivit
+
+        if (_uiState.value.selectedRow == -1) {  // käytä vertailuun saatua riviä
+            // No row is selected, do nothing or show a Toast
+            Log.w("UiViewModel", "Add row action called but no row is selected.")
+            android.os.Handler(Looper.getMainLooper()).post {
+                Toast.makeText(
+                    applicationContext,
+                    "Please select a row to add from column 1.",
+                    Toast.LENGTH_SHORT
+                )
+                    .show()
+            }
+            return
+        }
+
+        // make sure multiple adds don't happen with single row select
+        _uiState.update { it.copy(selectedRow = -1) }
+
+        // Check that 'static' rows are not broken
+        if (rowToAdd < 1) {
+            Log.i("UiViewModel", "Cannot add row here. Row=$rowToAdd}")
+            android.os.Handler(Looper.getMainLooper()).post {
+                Toast.makeText(applicationContext, "Cannot add row here.", Toast.LENGTH_SHORT)
+                    .show()
+            }
+            return
+        } else if (uiState.value.timerData.stepValues[rowToAdd-1] == 2 ) { // Cannot add below DT row
+            Log.i("UiViewModel", "Cannot add row here as it is DT row. Row=$rowToAdd, Step=${uiState.value.timerData.stepValues[rowToAdd-1]}")
+            android.os.Handler(Looper.getMainLooper()).post {
+                Toast.makeText(applicationContext, "Cannot add row here as it is DT row.", Toast.LENGTH_SHORT)
+                    .show()
+            }
+            return
+        }
+
+        // Check that MAX_TIMER_DATA_ROWS is not broken and last DT row is not touched
+        if (uiState.value.timerData.numberOfDataRows + 1 > MAX_TIMER_DATA_ROWS - 1) {
+            Log.i("UiViewModel", "Cannot add more that $MAX_TIMER_DATA_ROWS rows.")
+            android.os.Handler(Looper.getMainLooper()).post {
+                Toast.makeText(
+                    applicationContext,
+                    "Cannot add more that $MAX_TIMER_DATA_ROWS rows.",
+                    Toast.LENGTH_SHORT
+                )
+                    .show()
+            }
+            return
+        }
+
+        Log.i("UiViewModel", "Adding row $rowToAdd...")
+        _uiState.update { currentState ->
+            val currentTimerData = currentState.timerData
+            var newNumberOfRows = currentTimerData.numberOfDataRows + 1
+            if (newNumberOfRows > MAX_TIMER_DATA_ROWS) newNumberOfRows = MAX_TIMER_DATA_ROWS
+
+            // Create mutable copies of the lists to modify them
+            val newTimeValues = currentTimerData.timeValues.toMutableList()
+            val newServo1Values = currentTimerData.servo1Values.toMutableList()
+            val newServo2Values = currentTimerData.servo2Values.toMutableList()
+            val newServo3Values = currentTimerData.servo3Values.toMutableList()
+            val newServo4Values = currentTimerData.servo4Values.toMutableList()
+            val newStepValues = currentTimerData.stepValues.toMutableList()
+
+            // Shift all data rows down starting from the biggest row number
+            for (i in (newNumberOfRows - 2) downTo (rowToAdd - 1)) {
+                newTimeValues[i + 1] = newTimeValues[i]
+                newServo1Values[i + 1] = newServo1Values[i]
+                newServo2Values[i + 1] = newServo2Values[i]
+                newServo3Values[i + 1] = newServo3Values[i]
+                newServo4Values[i + 1] = newServo4Values[i]
+                newStepValues[i + 1] = newStepValues[i]
+            }
+
+            // Create a new TimerData object with all the updated values
+            val updatedTimerData = currentTimerData.copy(
+                numberOfDataRows = newNumberOfRows,
+                timeValues = newTimeValues,
+                servo1Values = newServo1Values,
+                servo2Values = newServo2Values,
+                servo3Values = newServo3Values,
+                servo4Values = newServo4Values,
+                stepValues = newStepValues
+            )
+
+            // Update the state with the new TimerData object
+            currentState.copy(timerData = updatedTimerData)
+        }
+    }
+
+    fun deleteRow() {
+        val rowToDelete = _uiState.value.selectedRow - 2 // vähennä start ja standby rivit
+
+        if (_uiState.value.selectedRow == -1) { // käytä vertailuun saatua riviä
+            // No row is selected, do nothing or show a Toast
+            Log.w("UiViewModel", "Delete row action called but no row is selected.")
+            android.os.Handler(Looper.getMainLooper()).post {
+                Toast.makeText(
+                    applicationContext,
+                    "Please select a row to delete from column 1.",
+                    Toast.LENGTH_SHORT
+                )
+                    .show()
+            }
+            return
+        }
+
+        // make sure multiple deletions don't happen with single row select
+        _uiState.update { it.copy(selectedRow = -1) }
+
+        // Check that 'static' rows are not deleted
+        if (rowToDelete < 1) {
+            Log.i("UiViewModel", "Cannot delete this row. Row=$rowToDelete")
+            android.os.Handler(Looper.getMainLooper()).post {
+                Toast.makeText(applicationContext, "Cannot delete this row.", Toast.LENGTH_SHORT)
+                    .show()
+            }
+            return
+        }
+
+        Log.i("UiViewModel", "Deleting row $rowToDelete...")
+        _uiState.update { currentState ->
+            val currentTimerData = currentState.timerData
+            var newNumberOfRows = currentTimerData.numberOfDataRows - 1
+            if (newNumberOfRows < 0) newNumberOfRows = 0
+
+            // Create mutable copies of the lists to modify them
+            val newTimeValues = currentTimerData.timeValues.toMutableList()
+            val newServo1Values = currentTimerData.servo1Values.toMutableList()
+            val newServo2Values = currentTimerData.servo2Values.toMutableList()
+            val newServo3Values = currentTimerData.servo3Values.toMutableList()
+            val newServo4Values = currentTimerData.servo4Values.toMutableList()
+
+            // Shift all data rows up. Starting from the deleted row's index
+            // Note: The loop should go up to 'newNumberOfRows'
+            for (i in (rowToDelete - 1) until newNumberOfRows) {
+                newTimeValues[i] = newTimeValues[i + 1]
+                newServo1Values[i] = newServo1Values[i + 1]
+                newServo2Values[i] = newServo2Values[i + 1]
+                newServo3Values[i] = newServo3Values[i + 1]
+                newServo4Values[i] = newServo4Values[i + 1]
+            }
+
+            // Create a new TimerData object with all the updated values
+            val updatedTimerData = currentTimerData.copy(
+                numberOfDataRows = newNumberOfRows,
+                timeValues = newTimeValues,
+                servo1Values = newServo1Values,
+                servo2Values = newServo2Values,
+                servo3Values = newServo3Values,
+                servo4Values = newServo4Values
+            )
+
+            // Update the state with the new TimerData object
+            currentState.copy(timerData = updatedTimerData)
+        }
+    }
+
+    fun copyDataSet(sourceSet: Int, destinationSet: Int) {
+        _uiState.update { currentState ->
+            val currentTimerData = currentState.timerData
+
+            // Make mutable copies of all the data tables
+            val timeValuesTable = currentTimerData.setTimeValues.toMutableList()
+            val servo1ValuesTable = currentTimerData.setServo1Values.toMutableList()
+            val servo2ValuesTable = currentTimerData.setServo2Values.toMutableList()
+            val servo3ValuesTable = currentTimerData.setServo3Values.toMutableList()
+            val servo4ValuesTable = currentTimerData.setServo4Values.toMutableList()
+
+            if (destinationSet < 0 || destinationSet >= timeValuesTable.size) return@update currentState
+
+            // Copy the data from the source index to the destination index
+            timeValuesTable[destinationSet] = currentTimerData.timeValues
+            servo1ValuesTable[destinationSet] = currentTimerData.servo1Values
+            servo2ValuesTable[destinationSet] = currentTimerData.servo2Values
+            servo3ValuesTable[destinationSet] = currentTimerData.servo3Values
+            servo4ValuesTable[destinationSet] = currentTimerData.servo4Values
+
+            // Create a new TimerData object with the updated tables
+            val updatedTimerData = currentTimerData.copy(
+                setTimeValues = timeValuesTable,
+                setServo1Values = servo1ValuesTable,
+                setServo2Values = servo2ValuesTable,
+                setServo3Values = servo3ValuesTable,
+                setServo4Values = servo4ValuesTable,
+            )
+
+            // Update the state
+            currentState.copy(timerData = updatedTimerData)
+        }
+        // Optionally, show a toast message to confirm the copy
+        android.os.Handler(Looper.getMainLooper()).post {
+            Toast.makeText(applicationContext, "Copied data from set $sourceSet to $destinationSet", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    fun switchDataSet(switchToSet: Int) {
+        _uiState.update { currentState ->
+            val currentTimerData = currentState.timerData
+            val currentSetIndex = currentTimerData.modelSet
+
+            if (switchToSet < 0 || switchToSet >= currentTimerData.setTimeValues.size) return@update currentState
+            if (currentSetIndex < 0 || currentSetIndex >= currentTimerData.setTimeValues.size) return@update currentState
+
+            val newSetTimeValues = currentTimerData.setTimeValues.toMutableList()
+            newSetTimeValues[currentSetIndex] = currentTimerData.timeValues
+
+            val newSetServo1Values = currentTimerData.setServo1Values.toMutableList()
+            newSetServo1Values[currentSetIndex] = currentTimerData.servo1Values
+
+            val newSetServo2Values = currentTimerData.setServo2Values.toMutableList()
+            newSetServo2Values[currentSetIndex] = currentTimerData.servo2Values
+
+            val newSetServo3Values = currentTimerData.setServo3Values.toMutableList()
+            newSetServo3Values[currentSetIndex] = currentTimerData.servo3Values
+
+            val newSetServo4Values = currentTimerData.setServo4Values.toMutableList()
+            newSetServo4Values[currentSetIndex] = currentTimerData.servo4Values
+
+            val newActiveTimeValues = newSetTimeValues[switchToSet].toList()
+            val newActiveServo1Values = newSetServo1Values[switchToSet].toList()
+            val newActiveServo2Values = newSetServo2Values[switchToSet].toList()
+            val newActiveServo3Values = newSetServo3Values[switchToSet].toList()
+            val newActiveServo4Values = newSetServo4Values[switchToSet].toList()
+
+            val updatedTimerData = currentTimerData.copy(
+                modelSet = switchToSet,
+
+                // Update the storage tables (with the previously active data saved)
+                setTimeValues = newSetTimeValues,
+                setServo1Values = newSetServo1Values,
+                setServo2Values = newSetServo2Values,
+                setServo3Values = newSetServo3Values,
+                setServo4Values = newSetServo4Values,
+
+                timeValues = newActiveTimeValues,
+                servo1Values = newActiveServo1Values,
+                servo2Values = newActiveServo2Values,
+                servo3Values = newActiveServo3Values,
+                servo4Values = newActiveServo4Values
+            )
+
+            currentState.copy(timerData = updatedTimerData)
+        }
+
+        Log.i("UiViewModel", "Switched data set to $switchToSet")
+    }
+
+
+    fun newTimerData(timerType: Int) {
+        val newTimerData = TimerData.createNew(timerType)
+
+        if (newTimerData.modelType == 0 && timerType != 0) { // Check if it fell back to default
+            Log.w("UiViewModel", "Unknown timer type: $timerType. Using defaults.")
+        } else {
+            Log.i("UiViewModel", "New TimerData created for type: $timerType")
+        }
+
+        _uiState.update { currentState ->
+            currentState.copy(
+                timerData = newTimerData
+            )
+        }
+    }
+
+    companion object {
+        val Factory: ViewModelProvider.Factory = viewModelFactory {
+            initializer {
+                val application = (this[APPLICATION_KEY] as PtTimerApplication)
+                UiViewModel(
+                    application = application,
+                    userPreferencesRepository = application.userPreferencesRepository,
+                    applicationContext = application.applicationContext
+                )
+            }
+        }
+    }
+}

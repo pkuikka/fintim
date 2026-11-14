@@ -1,0 +1,55 @@
+### AndroidStudio ###
+# Built application files
+*.apk
+*.ap_
+*.aab
+
+# Files for the ART/Dalvik VM
+*.dex
+
+# Java class files
+*.class
+
+# Generated files
+bin/
+gen/
+out/
+
+# Gradle files
+.gradle
+.gradle/
+build/
+app/build
+app/release
+app/debug
+
+# Local configuration file (sdk path, etc)
+local.properties
+
+# ... extensive list follows ...
+
+# IntelliJ IDEA
+*.iml
+*.iws
+/out/
+
+# User-specific configurations
+.idea/AndroidProjectSystem.xml
+.idea/caches/
+.idea/compiler.xml
+.idea/deploymentTargetSelector.xml
+.idea/gradle.xml
+.idea/markdown.xml
+.idea/migrations.xml
+.idea/misc.xml
+.idea/runConfigurations.xml
+.idea/vcs.xml
+.idea/workspace.xml
+.idea/
+
+.kotlin/sessions
+captures
+
+# secrets
+*.jks
+keystore.properties

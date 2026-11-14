@@ -1,0 +1,85 @@
+package com.example.fintim.data
+
+import android.util.Log
+import androidx.datastore.core.DataStore
+import androidx.datastore.preferences.core.Preferences
+import androidx.datastore.preferences.core.edit
+import androidx.datastore.preferences.core.emptyPreferences
+import androidx.datastore.preferences.core.floatPreferencesKey
+import androidx.datastore.preferences.core.stringPreferencesKey
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.flow.map
+import java.io.IOException
+
+class UserPreferencesRepository(
+    private val dataStore: DataStore<Preferences>
+) {
+    //  'dataStore' is now a fully initialized property of the class and can be safely accessed.
+    val displaySwipeVelocity: Flow<Float> = dataStore.data
+        .catch {
+            if(it is IOException) {
+                Log.e(TAG, "Error reading preferences.", it)
+                emit(emptyPreferences())
+            } else {
+                throw it
+            }
+        }
+        .map { preferences ->
+            // If the key doesn't exist, return the default value of 100F
+            preferences[DISPLAY_SWIPE_VELOCITY] ?: 150F
+        }
+    val displaySwipeDistance: Flow<Float> = dataStore.data
+        .catch {
+            if(it is IOException) {
+                Log.e(TAG, "Error reading preferences.", it)
+                emit(emptyPreferences())
+            } else {
+                throw it
+            }
+        }
+        .map { preferences ->
+            // If the key doesn't exist, return the default value of 100F
+            preferences[DISPLAY_SWIPE_DISTANCE] ?: 600F
+        }
+
+    val selectedBtDevice: Flow<String> = dataStore.data
+        .catch {
+            if (it is IOException) {
+                Log.e(TAG, "Error reading preferences.", it)
+                emit(emptyPreferences())
+            } else {
+                throw it
+            }
+        }
+        .map { preferences ->
+            // If the key doesn't exist, return an empty string
+            preferences[SELECTED_BT_DEVICE] ?: ""
+        }
+
+    private companion object {
+        val DISPLAY_SWIPE_VELOCITY = floatPreferencesKey("display_swipe_velocity")
+        val DISPLAY_SWIPE_DISTANCE = floatPreferencesKey("display_swipe_distance")
+        val SELECTED_BT_DEVICE = stringPreferencesKey("selected_bt_device")
+
+        const val TAG = "UserPreferencesRepo"
+    }
+
+    suspend fun saveSwipeVelocity(displaySwipeVelocity: Float) {
+        dataStore.edit { preferences ->
+            preferences[DISPLAY_SWIPE_VELOCITY] = displaySwipeVelocity
+        }
+    }
+
+    suspend fun saveSwipeDistance(displaySwipeDistance: Float) {
+        dataStore.edit { preferences ->
+            preferences[DISPLAY_SWIPE_DISTANCE] = displaySwipeDistance
+        }
+    }
+
+    suspend fun saveSelectedDevice(deviceName: String) {
+        dataStore.edit { preferences ->
+            preferences[SELECTED_BT_DEVICE] = deviceName
+        }
+    }
+}

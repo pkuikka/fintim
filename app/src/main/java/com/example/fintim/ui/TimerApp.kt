@@ -1,0 +1,45 @@
+package com.example.fintim.ui
+
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
+import androidx.lifecycle.viewmodel.compose.viewModel
+import androidx.navigation.compose.NavHost
+import androidx.navigation.compose.composable
+import androidx.navigation.compose.rememberNavController
+import com.example.fintim.ui.navigation.Screen
+
+//@RequiresPermission(Manifest.permission.BLUETOOTH_CONNECT)
+@Composable
+fun TimerApp() {
+    val navController = rememberNavController()
+    val uiViewModel: UiViewModel = viewModel(factory = UiViewModel.Factory)
+    val uiState by uiViewModel.uiState.collectAsState()
+
+    NavHost(
+        navController = navController, startDestination = Screen.Main.name
+    ) {
+        // Define the MainScreen
+        composable(route = Screen.Main.name) {
+            MainScreen(
+                onUserSettingsClick = {
+                    navController.navigate(Screen.UserSettings.name)
+                })
+        }
+
+        // Define the UserSettingsScreen
+        composable(route = Screen.UserSettings.name) {
+            UserSettingsScreen(
+                // Add a lambda to handle navigating back
+                onNavigateUp = {
+                    navController.navigateUp()
+                },
+                displaySwipeVelocity = uiState.displaySwipeVelocity,
+                onSwipeVelocityChanged = uiViewModel::onSwipeVelocityChanged,
+                displaySwipeDistance = uiState.displaySwipeDistance,
+                onSwipeDistanceChange = uiViewModel::onSwipeDistanceChange
+            )
+
+        }
+    }
+}
