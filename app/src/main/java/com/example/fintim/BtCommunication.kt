@@ -11,6 +11,7 @@ import android.bluetooth.BluetoothGattDescriptor
 import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothProfile
 import android.bluetooth.BluetoothSocket
+import android.bluetooth.BluetoothStatusCodes
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
@@ -237,6 +238,7 @@ class BtCommunication(private val context: Context) {
         }
     }
 
+    @Suppress("DEPRECATION")
     @RequiresPermission(allOf = [Manifest.permission.BLUETOOTH_CONNECT, Manifest.permission.BLUETOOTH_SCAN])
     private suspend fun connectBleDevice(deviceName: String, onConnectionResult: (Boolean) -> Unit) {
         pendingConnectionCallback = onConnectionResult
@@ -317,7 +319,7 @@ class BtCommunication(private val context: Context) {
                     override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
                         Log.i(TAG, "onServicesDiscovered: status=$status")
                         if (status == BluetoothGatt.GATT_SUCCESS) {
-                            Log.i(TAG, "BLE services discovered successfully. Status: $status")
+                            Log.i(TAG, "BLE services discovered successfully.")
                             var foundWrite = false
                             var foundRead = false
 
@@ -358,7 +360,7 @@ class BtCommunication(private val context: Context) {
                             }
 
                             // Fallback if specific ISSC characteristic wasn't matched
-                            if (!foundWrite || !foundRead) {
+                            if (!foundWrite) {
                                 for (service in gatt.services) {
                                     for (characteristic in service.characteristics) {
                                         val charUuid = characteristic.uuid.toString()
@@ -435,6 +437,7 @@ class BtCommunication(private val context: Context) {
                         }
                     }
 
+                    @Deprecated("Deprecated in Java")
                     override fun onCharacteristicChanged(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
                         val data = characteristic.value
                         if (data != null && data.isNotEmpty()) {
@@ -442,6 +445,7 @@ class BtCommunication(private val context: Context) {
                         }
                     }
 
+                    @Deprecated("Deprecated in Java")
                     override fun onCharacteristicRead(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, status: Int) {
                         if (status == BluetoothGatt.GATT_SUCCESS) {
                             val data = characteristic.value
@@ -537,7 +541,7 @@ class BtCommunication(private val context: Context) {
         try {
             Log.i(TAG, "Starting BLE scan for $deviceName...")
             scanner.startScan(callback)
-            withTimeoutOrNull(timeoutMs) {
+            withTimeoutOrNull(timeoutMs.milliseconds) {
                 withContext(Dispatchers.IO) {
                     latch.await()
                 }
@@ -578,7 +582,7 @@ class BtCommunication(private val context: Context) {
             }
 
             val success = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                gatt.writeCharacteristic(characteristic, chunk, writeType) == 0
+                gatt.writeCharacteristic(characteristic, chunk, writeType) == BluetoothStatusCodes.SUCCESS
             } else {
                 characteristic.value = chunk
                 gatt.writeCharacteristic(characteristic)
@@ -596,7 +600,7 @@ class BtCommunication(private val context: Context) {
                 }
             } else {
                 try {
-                    Thread.sleep(15)
+                    sleep(15)
                 } catch (_: InterruptedException) {}
             }
 
